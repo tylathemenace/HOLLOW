@@ -20,6 +20,7 @@ const CODE = (n) => Array.from({ length: n }, () => "ABCDEFGHJKLMNPQRSTUVWXYZ234
 const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n | 0));
 const safe = (s) => String(s || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 60);
 const ctl = (o) => JSON.stringify(o);
+const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 
 /* ---------- static website ---------- */
 const MIME = { ".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css", ".json": "application/json", ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg", ".ico": "image/x-icon", ".txt": "text/plain" };
@@ -64,10 +65,12 @@ const peers = new Map();    // game -> Map<id, ws>
 server.on("upgrade", (req, socket, head) => {
   const u = new URL(req.url, "http://x");
   const origin = req.headers.origin;
-  if (ALLOWED.length && origin && !ALLOWED.includes(origin)) { socket.write("HTTP/1.1 403 Forbidden\r\n\r\n"); return socket.destroy(); }
+  if (ALLOWED.length && origin && !ALLOWED.includes(origin)) { log("BLOCKED origin:", origin, "(allowed:", ALLOWED.join(", ") + ")"); socket.write("HTTP/1.1 403 Forbidden\r\n\r\n"); return socket.destroy(); }
   const [kind, id] = u.pathname.split("/").filter(Boolean);
-  if (!["mm", "room", "peer"].includes(kind) || !safe(id)) { socket.write("HTTP/1.1 404 Not Found\r\n\r\n"); return socket.destroy(); }
+  if (!["mm", "room", "peer"].includes(kind) || !safe(id)) { log("rejected ws path:", u.pathname); socket.write("HTTP/1.1 404 Not Found\r\n\r\n"); return socket.destroy(); }
   wss.handleUpgrade(req, socket, head, (ws) => {
+    log("ws open:", kind + "/" + safe(id), "| origin:", origin || "none", "| clients:", wss.clients.size);
+    ws.on("close", () => log("ws close:", kind + "/" + safe(id), "| clients:", wss.clients.size));
     ws.isAlive = true;
     ws.on("pong", () => { ws.isAlive = true; });
     ws.on("error", () => {});
@@ -97,6 +100,7 @@ function room(ws, key, q) {
   ws.role = hasHost ? "guest" : "host";
   r.members.add(ws);
   const n = r.members.size;
+  log("room", key, ws.role, "joined (" + n + "/" + r.size + ")");
   send(ws, { _s: "role", role: ws.role, peer: n > 1, n, size: r.size });
   for (const s of r.members) if (s !== ws) send(s, { _s: "peer", on: true, n, size: r.size });
   ws.on("message", (m, isBin) => {
@@ -115,6 +119,7 @@ function lobby(ws, game, q) {
   ws.meta = { size: clamp(parseInt(q.get("size")) || 2, 2, 8), name: (q.get("name") || "Player").slice(0, 20), t: Date.now() };
   let set = lobbies.get(game); if (!set) lobbies.set(game, (set = new Set()));
   set.add(ws);
+  log("queue", game, "+", ws.meta.name, "(size " + ws.meta.size + ", waiting " + set.size + ")");
   const pump = () => {
     const waiting = [...set].filter((s) => s.readyState === 1).sort((a, b) => a.meta.t - b.meta.t);
     const bySize = {};
@@ -123,6 +128,7 @@ function lobby(ws, game, q) {
       const qq = bySize[sz], need = +sz;
       while (qq.length >= need) {
         const group = qq.splice(0, need), code = CODE(6), names = group.map((g) => g.meta.name);
+        log("MATCH", game, "room", code, "players:", names.join(", "));
         for (const g of group) { set.delete(g); send(g, { _s: "match", room: code, size: need, names }); try { g.close(1000, "matched"); } catch (e) {} }
       }
       for (const w of qq) send(w, { _s: "queue", n: qq.length, need });
@@ -151,6 +157,7 @@ function peer(ws, game, q) {
       if (map.has(id) && map.get(id).readyState === 1) return send(ws, { t: "idtaken" });
       if (map.size >= MAX_PEERS) return send(ws, { t: "idtaken", why: "busy" });
       ws.pid = id; map.set(id, ws);
+      log("peer", game, "registered", id, "(" + map.size + " online)");
       return send(ws, { t: "ready", id });
     }
     if (!ws.pid) return;
@@ -170,4 +177,11 @@ function peer(ws, game, q) {
 /* ---------- keep connections honest (drops dead sockets, also keeps free hosts awake while games run) ---------- */
 setInterval(() => { for (const ws of wss.clients) { if (!ws.isAlive) { try { ws.terminate(); } catch (e) {} continue; } ws.isAlive = false; try { ws.ping(); } catch (e) {} } }, 30000);
 
-server.listen(PORT, () => console.log("Hollow Arcade server on :" + PORT));
+server.listen(PORT, () => {
+  log("Hollow Arcade server on :" + PORT);
+  log("allowed origins:", ALLOWED.length ? ALLOWED.join(", ") : "any");
+  log("site files:", fs.existsSync(path.join(ROOT, "index.html")) ? "public/index.html found" : "NO public/index.html (site not served from here)");
+});
+
+// heartbeat line every 5 min, only when someone is connected
+setInterval(() => { if (wss.clients.size) log("status: clients", wss.clients.size, "| rooms", rooms.size, "| queues", [...lobbies.values()].reduce((a, b) => a + b.size, 0)); }, 300000);
